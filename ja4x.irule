@@ -1,0 +1,464 @@
+###############################################################################################
+#  iRule to calculate JA4X "X509 TLS Certificate Fingerprint"
+#  See JA4 spec on GitHub for more details
+#  https://github.com/FoxIO-LLC/ja4/blob/main/technical_details/README.md
+#
+#  Parses the raw TLS Certificate handshake message (type 11) from the server-side
+#  TCP stream.  No SSL profile or decryption is required.  Works with TLS 1.2 and
+#  earlier where the Certificate message is transmitted in the clear.  In TLS 1.3
+#  the Certificate is inside the encrypted record, so no fingerprint is produced.
+#
+#  Fingerprint format: {issuer_hash}_{subject_hash}_{extensions_hash}
+#  Each hash = SHA256[:12] of comma-joined OID content bytes (hex, in order of
+#  appearance -- NOT sorted) from the server certificate's Issuer RDNSequence,
+#  Subject RDNSequence, and X.509v3 Extensions respectively.
+#
+#  Copyright (c) 2024, FoxIO, LLC.
+#  All rights reserved.
+#  Licensed under FoxIO License 1.1
+#  For full license text and more details, see the repo root https://github.com/FoxIO-LLC/ja4
+#
+###############################################################################################
+
+when RULE_INIT {
+    # Maximum bytes to buffer while searching for the Certificate record.
+    set static::ja4x_max_buf 32768
+    # Guard against malformed data with unbounded structures.
+    set static::ja4x_max_iter 256
+}
+
+# ---------------------------------------------------------------------------
+# der_read_len  payload off bound
+#   Reads a DER length field at byte offset 'off' within 'payload'.
+#   Returns {length value_start_offset} or "" on error.
+# ---------------------------------------------------------------------------
+proc der_read_len { payload off bound } {
+    if { ${off} >= ${bound} } { return "" }
+    binary scan ${payload} @${off}c lbyte
+    set lbyte [expr { ${lbyte} & 0xff }]
+    incr off
+    if { ${lbyte} < 0x80 } {
+        return [list ${lbyte} ${off}]
+    }
+    # Indefinite length is not valid in DER.
+    if { ${lbyte} == 0x80 } { return "" }
+    set nbytes [expr { ${lbyte} & 0x7f }]
+    if { ${nbytes} > 4 || ${off} + ${nbytes} > ${bound} } { return "" }
+    set len 0
+    for { set i 0 } { ${i} < ${nbytes} } { incr i } {
+        binary scan ${payload} @${off}c byte
+        set byte [expr { ${byte} & 0xff }]
+        set len [expr { (${len} << 8) | ${byte} }]
+        incr off
+    }
+    return [list ${len} ${off}]
+}
+
+# ---------------------------------------------------------------------------
+# der_skip  payload off bound
+#   Skips the complete DER TLV whose tag byte is at 'off'.
+#   Returns the offset of the next TLV, or -1 on error.
+# ---------------------------------------------------------------------------
+proc der_skip { payload off bound } {
+    if { ${off} >= ${bound} } { return -1 }
+    incr off  ;# past tag
+    set r [call der_read_len ${payload} ${off} ${bound}]
+    if { ${r} eq "" } { return -1 }
+    set end [expr { [lindex ${r} 1] + [lindex ${r} 0] }]
+    if { ${end} > ${bound} } { return -1 }
+    return ${end}
+}
+
+# ---------------------------------------------------------------------------
+# parse_rdns  payload off bound
+#   Parses an RDNSequence value (issuer or subject).  'off' points at the
+#   first SET byte within the sequence value; 'bound' is the end of the
+#   sequence value.
+#   Returns a Tcl list of OID content bytes encoded as hex strings, in the
+#   order they appear (one per AttributeTypeAndValue).
+# ---------------------------------------------------------------------------
+proc parse_rdns { payload off bound } {
+    set oid_list [list]
+    set iter 0
+    while { ${off} + 2 <= ${bound} } {
+        if { [incr iter] > $static::ja4x_max_iter } { break }
+
+        # Each RDN is a SET (0x31).
+        binary scan ${payload} @${off}c tag
+        set tag [expr { ${tag} & 0xff }]
+        incr off
+        set r [call der_read_len ${payload} ${off} ${bound}]
+        if { ${r} eq "" } { break }
+        set set_len  [lindex ${r} 0]
+        set set_voff [lindex ${r} 1]
+        set set_end  [expr { ${set_voff} + ${set_len} }]
+        if { ${set_end} > ${bound} } { break }
+
+        if { ${tag} == 0x31 } {
+            # Each AttributeTypeAndValue is a SEQUENCE { OID, ANY }.
+            set soff  ${set_voff}
+            set siter 0
+            while { ${soff} + 2 <= ${set_end} } {
+                if { [incr siter] > $static::ja4x_max_iter } { break }
+                binary scan ${payload} @${soff}c stag
+                set stag [expr { ${stag} & 0xff }]
+                incr soff
+                set sr [call der_read_len ${payload} ${soff} ${set_end}]
+                if { ${sr} eq "" } { break }
+                set seq_len  [lindex ${sr} 0]
+                set seq_voff [lindex ${sr} 1]
+                set seq_end  [expr { ${seq_voff} + ${seq_len} }]
+                if { ${seq_end} > ${set_end} } { break }
+
+                if { ${stag} == 0x30 } {
+                    # First element must be the OID (tag 0x06).
+                    set ooff ${seq_voff}
+                    if { ${ooff} + 2 <= ${seq_end} } {
+                        binary scan ${payload} @${ooff}c otag
+                        set otag [expr { ${otag} & 0xff }]
+                        incr ooff
+                        if { ${otag} == 0x06 } {
+                            set or [call der_read_len ${payload} ${ooff} ${seq_end}]
+                            if { ${or} ne "" } {
+                                set olen  [lindex ${or} 0]
+                                set ovoff [lindex ${or} 1]
+                                if { ${olen} > 0 && ${ovoff} + ${olen} <= ${seq_end} } {
+                                    set nhex [expr { ${olen} * 2 }]
+                                    unset -nocomplain oid_hex
+                                    binary scan ${payload} @${ovoff}H${nhex} oid_hex
+                                    if { [info exists oid_hex] } {
+                                        lappend oid_list ${oid_hex}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                set soff ${seq_end}
+            }
+        }
+        set off ${set_end}
+    }
+    return ${oid_list}
+}
+
+# ---------------------------------------------------------------------------
+# parse_extensions  payload off bound
+#   Parses the value of an Extensions SEQUENCE OF Extension.  'off' points
+#   at the first Extension SEQUENCE byte; 'bound' is the end of the outer
+#   SEQUENCE value.
+#   Returns a Tcl list of extension OID content bytes as hex strings, in
+#   the order they appear.
+# ---------------------------------------------------------------------------
+proc parse_extensions { payload off bound } {
+    set oid_list [list]
+    set iter 0
+    while { ${off} + 2 <= ${bound} } {
+        if { [incr iter] > $static::ja4x_max_iter } { break }
+
+        # Each Extension is a SEQUENCE { OID, [BOOLEAN,] OCTET STRING }.
+        binary scan ${payload} @${off}c tag
+        set tag [expr { ${tag} & 0xff }]
+        incr off
+        set r [call der_read_len ${payload} ${off} ${bound}]
+        if { ${r} eq "" } { break }
+        set seq_len  [lindex ${r} 0]
+        set seq_voff [lindex ${r} 1]
+        set seq_end  [expr { ${seq_voff} + ${seq_len} }]
+        if { ${seq_end} > ${bound} } { break }
+
+        if { ${tag} == 0x30 } {
+            # First element is the extension OID (tag 0x06).
+            set ooff ${seq_voff}
+            if { ${ooff} + 2 <= ${seq_end} } {
+                binary scan ${payload} @${ooff}c otag
+                set otag [expr { ${otag} & 0xff }]
+                incr ooff
+                if { ${otag} == 0x06 } {
+                    set or [call der_read_len ${payload} ${ooff} ${seq_end}]
+                    if { ${or} ne "" } {
+                        set olen  [lindex ${or} 0]
+                        set ovoff [lindex ${or} 1]
+                        if { ${olen} > 0 && ${ovoff} + ${olen} <= ${seq_end} } {
+                            set nhex [expr { ${olen} * 2 }]
+                            unset -nocomplain oid_hex
+                            binary scan ${payload} @${ovoff}H${nhex} oid_hex
+                            if { [info exists oid_hex] } {
+                                lappend oid_list ${oid_hex}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        set off ${seq_end}
+    }
+    return ${oid_list}
+}
+
+# ---------------------------------------------------------------------------
+# parseCert  payload cert_off cert_end
+#   Parses a DER-encoded X.509 certificate in 'payload' between byte
+#   offsets 'cert_off' (inclusive) and 'cert_end' (exclusive).
+#   Returns "issuer_hash_subject_hash_ext_hash" or "" on parse error.
+# ---------------------------------------------------------------------------
+proc parseCert { payload cert_off cert_end } {
+    set bound ${cert_end}
+
+    # ---- Outer Certificate SEQUENCE ----------------------------------------
+    if { ${cert_off} + 2 > ${bound} } { return "" }
+    binary scan ${payload} @${cert_off}c tag
+    if { ([expr { ${tag} & 0xff }]) != 0x30 } { return "" }
+    set off [expr { ${cert_off} + 1 }]
+    set r [call der_read_len ${payload} ${off} ${bound}]
+    if { ${r} eq "" } { return "" }
+    # Advance into the TBSCertificate (first child of the outer SEQUENCE).
+    set off [lindex ${r} 1]
+
+    # ---- TBSCertificate SEQUENCE -------------------------------------------
+    if { ${off} + 2 > ${bound} } { return "" }
+    binary scan ${payload} @${off}c tag
+    if { ([expr { ${tag} & 0xff }]) != 0x30 } { return "" }
+    incr off
+    set r [call der_read_len ${payload} ${off} ${bound}]
+    if { ${r} eq "" } { return "" }
+    set tbs_voff [lindex ${r} 1]
+    set tbs_end  [expr { ${tbs_voff} + [lindex ${r} 0] }]
+    if { ${tbs_end} > ${bound} } { return "" }
+    set off ${tbs_voff}
+
+    # ---- version [0] EXPLICIT (optional, present in v2/v3) -----------------
+    if { ${off} >= ${tbs_end} } { return "" }
+    binary scan ${payload} @${off}c tag
+    set tag [expr { ${tag} & 0xff }]
+    if { ${tag} == 0xa0 } {
+        set off [call der_skip ${payload} ${off} ${tbs_end}]
+        if { ${off} < 0 } { return "" }
+        binary scan ${payload} @${off}c tag
+        set tag [expr { ${tag} & 0xff }]
+    }
+
+    # ---- serialNumber INTEGER ----------------------------------------------
+    if { ${tag} != 0x02 } { return "" }
+    set off [call der_skip ${payload} ${off} ${tbs_end}]
+    if { ${off} < 0 } { return "" }
+
+    # ---- signature AlgorithmIdentifier SEQUENCE ----------------------------
+    set off [call der_skip ${payload} ${off} ${tbs_end}]
+    if { ${off} < 0 } { return "" }
+
+    # ---- issuer RDNSequence SEQUENCE ---------------------------------------
+    if { ${off} + 2 > ${tbs_end} } { return "" }
+    binary scan ${payload} @${off}c tag
+    if { ([expr { ${tag} & 0xff }]) != 0x30 } { return "" }
+    incr off
+    set r [call der_read_len ${payload} ${off} ${tbs_end}]
+    if { ${r} eq "" } { return "" }
+    set iss_voff [lindex ${r} 1]
+    set iss_end  [expr { ${iss_voff} + [lindex ${r} 0] }]
+    if { ${iss_end} > ${tbs_end} } { return "" }
+    set issuer_oids [call parse_rdns ${payload} ${iss_voff} ${iss_end}]
+    set off ${iss_end}
+
+    # ---- validity SEQUENCE (skip) -----------------------------------------
+    set off [call der_skip ${payload} ${off} ${tbs_end}]
+    if { ${off} < 0 } { return "" }
+
+    # ---- subject RDNSequence SEQUENCE -------------------------------------
+    if { ${off} + 2 > ${tbs_end} } { return "" }
+    binary scan ${payload} @${off}c tag
+    if { ([expr { ${tag} & 0xff }]) != 0x30 } { return "" }
+    incr off
+    set r [call der_read_len ${payload} ${off} ${tbs_end}]
+    if { ${r} eq "" } { return "" }
+    set subj_voff [lindex ${r} 1]
+    set subj_end  [expr { ${subj_voff} + [lindex ${r} 0] }]
+    if { ${subj_end} > ${tbs_end} } { return "" }
+    set subject_oids [call parse_rdns ${payload} ${subj_voff} ${subj_end}]
+    set off ${subj_end}
+
+    # ---- subjectPublicKeyInfo SEQUENCE (skip) ------------------------------
+    set off [call der_skip ${payload} ${off} ${tbs_end}]
+    if { ${off} < 0 } { return "" }
+
+    # ---- optional issuerUniqueID [1] and subjectUniqueID [2] (skip) --------
+    while { ${off} < ${tbs_end} } {
+        binary scan ${payload} @${off}c tag
+        set tag [expr { ${tag} & 0xff }]
+        if { ${tag} == 0xa1 || ${tag} == 0xa2 } {
+            set off [call der_skip ${payload} ${off} ${tbs_end}]
+            if { ${off} < 0 } { break }
+        } else {
+            break
+        }
+    }
+
+    # ---- extensions [3] EXPLICIT (optional, v3 only) ----------------------
+    set ext_oids [list]
+    if { ${off} < ${tbs_end} } {
+        binary scan ${payload} @${off}c tag
+        set tag [expr { ${tag} & 0xff }]
+        if { ${tag} == 0xa3 } {
+            incr off
+            set r [call der_read_len ${payload} ${off} ${tbs_end}]
+            if { ${r} ne "" } {
+                set exta_voff [lindex ${r} 1]
+                set exta_end  [expr { ${exta_voff} + [lindex ${r} 0] }]
+                if { ${exta_end} <= ${tbs_end} } {
+                    # [3] wraps a SEQUENCE OF Extension.
+                    binary scan ${payload} @${exta_voff}c tag
+                    if { ([expr { ${tag} & 0xff }]) == 0x30 } {
+                        set xoff [expr { ${exta_voff} + 1 }]
+                        set xr [call der_read_len ${payload} ${xoff} ${exta_end}]
+                        if { ${xr} ne "" } {
+                            set exts_voff [lindex ${xr} 1]
+                            set exts_end  [expr { ${exts_voff} + [lindex ${xr} 0] }]
+                            if { ${exts_end} <= ${exta_end} } {
+                                set ext_oids [call parse_extensions \
+                                    ${payload} ${exts_voff} ${exts_end}]
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    # ---- Build hashes (OIDs in order of appearance, no sorting) -----------
+    set issuer_str  [join ${issuer_oids}  ","]
+    set subject_str [join ${subject_oids} ","]
+    set ext_str     [join ${ext_oids}     ","]
+
+    if { ${issuer_str} eq "" } {
+        set i_hash "000000000000"
+    } else {
+        binary scan [sha256 ${issuer_str}] H* _h
+        set i_hash [string range ${_h} 0 11]
+    }
+    if { ${subject_str} eq "" } {
+        set s_hash "000000000000"
+    } else {
+        binary scan [sha256 ${subject_str}] H* _h
+        set s_hash [string range ${_h} 0 11]
+    }
+    if { ${ext_str} eq "" } {
+        set e_hash "000000000000"
+    } else {
+        binary scan [sha256 ${ext_str}] H* _h
+        set e_hash [string range ${_h} 0 11]
+    }
+
+    return "${i_hash}_${s_hash}_${e_hash}"
+}
+
+
+when SERVER_CONNECTED {
+    unset -nocomplain ja4x
+    TCP::collect
+}
+
+when SERVER_DATA {
+    set payload [TCP::payload]
+    set plen    [TCP::payload length]
+
+    # Need at least a TLS record header.
+    if { $plen < 5 } {
+        TCP::collect 5
+        return
+    }
+
+    # Walk TLS records in the buffer looking for the Certificate message
+    # (handshake type 11 = 0x0b).  The Certificate follows the ServerHello
+    # and is unencrypted in TLS 1.2 and earlier.  Stop if we see an
+    # application-data record (TLS 1.3 encrypted handshake) or exhaust the
+    # buffer limit.
+    set off  0
+    set done 0
+    set iter 0
+
+    while { !${done} && ${off} + 5 <= ${plen} } {
+        if { [incr iter] > $static::ja4x_max_iter } { set done 1; break }
+
+        binary scan $payload @${off}cH4S rtype proto_ver rec_len
+        set rtype   [expr { $rtype   & 0xff }]
+        set rec_len [expr { $rec_len & 0xffff }]
+        set rec_end [expr { $off + 5 + $rec_len }]
+
+        # If the full record has not arrived yet, collect it (within limits).
+        if { $rec_end > $plen } {
+            if { $rec_end <= $static::ja4x_max_buf } {
+                TCP::collect $rec_end
+                return
+            }
+            set done 1
+            break
+        }
+
+        if { $rtype == 22 && $rec_len >= 4 } {
+            # Handshake record -- inspect the handshake type.
+            binary scan $payload @[expr { $off + 5 }]c hs_type
+            set hs_type [expr { $hs_type & 0xff }]
+
+            if { $hs_type == 11 } {
+                # Found the Certificate message.
+                # Layout (relative to $off):
+                #   +5  : hs_type (1 byte, already read)
+                #   +6  : hs_length (3 bytes, uint24)
+                #   +9  : cert_list_length (3 bytes, uint24)
+                #   +12 : first_cert_length (3 bytes, uint24)
+                #   +15 : first certificate DER data
+
+                if { $off + 15 <= $rec_end } {
+                    binary scan $payload \
+                        @[expr { $off + 12 }]ccc fcl_b0 fcl_b1 fcl_b2
+                    set first_cert_len [expr {
+                        (($fcl_b0 & 0xff) << 16) |
+                        (($fcl_b1 & 0xff) <<  8) |
+                         ($fcl_b2 & 0xff)
+                    }]
+                    set cert_off [expr { $off + 15 }]
+                    set cert_end [expr { $cert_off + $first_cert_len }]
+                    if { $first_cert_len > 0 && $cert_end <= $rec_end } {
+                        set ja4x [call parseCert $payload $cert_off $cert_end]
+                    }
+                }
+                set done 1
+
+            } elseif { $hs_type == 20 || $hs_type == 21 } {
+                # ChangeCipherSpec (20) or Finished (21) -- encrypted data
+                # follows; no Certificate will appear unencrypted after this.
+                set done 1
+            }
+            # ServerHello (2), ServerKeyExchange (12), ServerHelloDone (14),
+            # etc. -- skip and continue to next record.
+
+        } elseif { $rtype == 23 || $rtype == 21 } {
+            # Application data or Alert -- stop.
+            set done 1
+        }
+
+        set off $rec_end
+    }
+
+    # If the loop ended because we exhausted the buffered payload (not because
+    # we found what we need or hit a hard stop), try to collect more data.
+    if { !${done} && $plen < $static::ja4x_max_buf } {
+        TCP::collect [expr { $plen + 5 }]
+        return
+    }
+
+    TCP::release
+}
+
+when HTTP_REQUEST {
+    # Strip any client-supplied X-JA4X* headers to prevent spoofing.
+    foreach jh [HTTP::header names] {
+        if { [string tolower ${jh}] starts_with "x-ja4x" } {
+            HTTP::header remove ${jh}
+        }
+    }
+    if { [info exists ja4x] && ${ja4x} ne "" } {
+        HTTP::header insert "X-JA4X" ${ja4x}
+        log local0. "JA4X=${ja4x} src=[IP::client_addr]:[TCP::client_port]"
+    }
+}
