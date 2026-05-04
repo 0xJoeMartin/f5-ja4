@@ -1,0 +1,584 @@
+###############################################################################################
+#  iRule to calculate both JA4S "Server TLS Fingerprint" and JA4X "X509 Certificate
+#  Fingerprint" in a single SERVER_DATA pass.
+#
+#  Background: ja4s.irule and ja4x.irule each call TCP::collect in their SERVER_DATA
+#  event handlers.  On an F5 virtual server only one iRule's TCP::collect wins per
+#  server-side connection, so the two cannot be applied independently.  This combined
+#  iRule walks the server-side TLS record stream once, capturing the ServerHello
+#  (handshake type 2) for JA4S and the Certificate message (handshake type 11) for
+#  JA4X from the same TCP payload buffer.
+#
+#  No SSL profile or decryption is required.  Fingerprints are produced for TLS 1.2
+#  and earlier where both messages are transmitted in the clear.  In TLS 1.3 the
+#  Certificate message is inside an encrypted record, so JA4X is not produced; JA4S
+#  is still produced from the (unencrypted) ServerHello.
+#
+#  See the JA4 spec for details:
+#  https://github.com/FoxIO-LLC/ja4/blob/main/technical_details/JA4.md
+#
+#  Copyright (c) 2024, FoxIO, LLC.
+#  All rights reserved.
+#  Licensed under FoxIO License 1.1
+#  For full license text and more details, see the repo root https://github.com/FoxIO-LLC/ja4
+#
+###############################################################################################
+
+when RULE_INIT {
+    # Maximum bytes to buffer while walking the server-side TLS handshake.
+    set static::ja4sx_max_buf 32768
+    # Guard against malformed data with unbounded structures.
+    set static::ja4sx_max_iter 256
+}
+
+# ---------------------------------------------------------------------------
+# der_read_len  payload off bound
+#   Reads a DER length field at byte offset 'off' within 'payload'.
+#   Returns {length value_start_offset} or "" on error.
+# ---------------------------------------------------------------------------
+proc der_read_len { payload off bound } {
+    if { ${off} >= ${bound} } { return "" }
+    binary scan ${payload} @${off}c lbyte
+    set lbyte [expr { ${lbyte} & 0xff }]
+    incr off
+    if { ${lbyte} < 0x80 } {
+        return [list ${lbyte} ${off}]
+    }
+    if { ${lbyte} == 0x80 } { return "" }
+    set nbytes [expr { ${lbyte} & 0x7f }]
+    if { ${nbytes} > 4 || ${off} + ${nbytes} > ${bound} } { return "" }
+    set len 0
+    for { set i 0 } { ${i} < ${nbytes} } { incr i } {
+        binary scan ${payload} @${off}c byte
+        set byte [expr { ${byte} & 0xff }]
+        set len [expr { (${len} << 8) | ${byte} }]
+        incr off
+    }
+    return [list ${len} ${off}]
+}
+
+# ---------------------------------------------------------------------------
+# der_skip  payload off bound
+#   Skips the complete DER TLV whose tag byte is at 'off'.
+#   Returns the offset of the next TLV, or -1 on error.
+# ---------------------------------------------------------------------------
+proc der_skip { payload off bound } {
+    if { ${off} >= ${bound} } { return -1 }
+    incr off
+    set r [call der_read_len ${payload} ${off} ${bound}]
+    if { ${r} eq "" } { return -1 }
+    set end [expr { [lindex ${r} 1] + [lindex ${r} 0] }]
+    if { ${end} > ${bound} } { return -1 }
+    return ${end}
+}
+
+# ---------------------------------------------------------------------------
+# parse_rdns  payload off bound
+#   Parses an RDNSequence value (issuer or subject).  'off' points at the
+#   first SET byte within the sequence value; 'bound' is the end of the
+#   sequence value.
+#   Returns a Tcl list of OID content bytes encoded as hex strings, in the
+#   order they appear (one per AttributeTypeAndValue).
+# ---------------------------------------------------------------------------
+proc parse_rdns { payload off bound } {
+    set oid_list [list]
+    set iter 0
+    while { ${off} + 2 <= ${bound} } {
+        if { [incr iter] > $static::ja4sx_max_iter } { break }
+
+        binary scan ${payload} @${off}c tag
+        set tag [expr { ${tag} & 0xff }]
+        incr off
+        set r [call der_read_len ${payload} ${off} ${bound}]
+        if { ${r} eq "" } { break }
+        set set_len  [lindex ${r} 0]
+        set set_voff [lindex ${r} 1]
+        set set_end  [expr { ${set_voff} + ${set_len} }]
+        if { ${set_end} > ${bound} } { break }
+
+        if { ${tag} == 0x31 } {
+            set soff  ${set_voff}
+            set siter 0
+            while { ${soff} + 2 <= ${set_end} } {
+                if { [incr siter] > $static::ja4sx_max_iter } { break }
+                binary scan ${payload} @${soff}c stag
+                set stag [expr { ${stag} & 0xff }]
+                incr soff
+                set sr [call der_read_len ${payload} ${soff} ${set_end}]
+                if { ${sr} eq "" } { break }
+                set seq_len  [lindex ${sr} 0]
+                set seq_voff [lindex ${sr} 1]
+                set seq_end  [expr { ${seq_voff} + ${seq_len} }]
+                if { ${seq_end} > ${set_end} } { break }
+
+                if { ${stag} == 0x30 } {
+                    set ooff ${seq_voff}
+                    if { ${ooff} + 2 <= ${seq_end} } {
+                        binary scan ${payload} @${ooff}c otag
+                        set otag [expr { ${otag} & 0xff }]
+                        incr ooff
+                        if { ${otag} == 0x06 } {
+                            set or [call der_read_len ${payload} ${ooff} ${seq_end}]
+                            if { ${or} ne "" } {
+                                set olen  [lindex ${or} 0]
+                                set ovoff [lindex ${or} 1]
+                                if { ${olen} > 0 && ${ovoff} + ${olen} <= ${seq_end} } {
+                                    set nhex [expr { ${olen} * 2 }]
+                                    unset -nocomplain oid_hex
+                                    binary scan ${payload} @${ovoff}H${nhex} oid_hex
+                                    if { [info exists oid_hex] } {
+                                        lappend oid_list ${oid_hex}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                set soff ${seq_end}
+            }
+        }
+        set off ${set_end}
+    }
+    return ${oid_list}
+}
+
+# ---------------------------------------------------------------------------
+# parse_extensions  payload off bound
+#   Parses the value of an Extensions SEQUENCE OF Extension.  'off' points
+#   at the first Extension SEQUENCE byte; 'bound' is the end of the outer
+#   SEQUENCE value.
+#   Returns a Tcl list of extension OID content bytes as hex strings, in
+#   the order they appear.
+# ---------------------------------------------------------------------------
+proc parse_extensions { payload off bound } {
+    set oid_list [list]
+    set iter 0
+    while { ${off} + 2 <= ${bound} } {
+        if { [incr iter] > $static::ja4sx_max_iter } { break }
+
+        binary scan ${payload} @${off}c tag
+        set tag [expr { ${tag} & 0xff }]
+        incr off
+        set r [call der_read_len ${payload} ${off} ${bound}]
+        if { ${r} eq "" } { break }
+        set seq_len  [lindex ${r} 0]
+        set seq_voff [lindex ${r} 1]
+        set seq_end  [expr { ${seq_voff} + ${seq_len} }]
+        if { ${seq_end} > ${bound} } { break }
+
+        if { ${tag} == 0x30 } {
+            set ooff ${seq_voff}
+            if { ${ooff} + 2 <= ${seq_end} } {
+                binary scan ${payload} @${ooff}c otag
+                set otag [expr { ${otag} & 0xff }]
+                incr ooff
+                if { ${otag} == 0x06 } {
+                    set or [call der_read_len ${payload} ${ooff} ${seq_end}]
+                    if { ${or} ne "" } {
+                        set olen  [lindex ${or} 0]
+                        set ovoff [lindex ${or} 1]
+                        if { ${olen} > 0 && ${ovoff} + ${olen} <= ${seq_end} } {
+                            set nhex [expr { ${olen} * 2 }]
+                            unset -nocomplain oid_hex
+                            binary scan ${payload} @${ovoff}H${nhex} oid_hex
+                            if { [info exists oid_hex] } {
+                                lappend oid_list ${oid_hex}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        set off ${seq_end}
+    }
+    return ${oid_list}
+}
+
+# ---------------------------------------------------------------------------
+# parseCert  payload cert_off cert_end
+#   Parses a DER-encoded X.509 certificate in 'payload' between byte
+#   offsets 'cert_off' (inclusive) and 'cert_end' (exclusive).
+#   Returns "issuer_hash_subject_hash_ext_hash" or "" on parse error.
+# ---------------------------------------------------------------------------
+proc parseCert { payload cert_off cert_end } {
+    set bound ${cert_end}
+
+    if { ${cert_off} + 2 > ${bound} } { return "" }
+    binary scan ${payload} @${cert_off}c tag
+    if { ([expr { ${tag} & 0xff }]) != 0x30 } { return "" }
+    set off [expr { ${cert_off} + 1 }]
+    set r [call der_read_len ${payload} ${off} ${bound}]
+    if { ${r} eq "" } { return "" }
+    set off [lindex ${r} 1]
+
+    if { ${off} + 2 > ${bound} } { return "" }
+    binary scan ${payload} @${off}c tag
+    if { ([expr { ${tag} & 0xff }]) != 0x30 } { return "" }
+    incr off
+    set r [call der_read_len ${payload} ${off} ${bound}]
+    if { ${r} eq "" } { return "" }
+    set tbs_voff [lindex ${r} 1]
+    set tbs_end  [expr { ${tbs_voff} + [lindex ${r} 0] }]
+    if { ${tbs_end} > ${bound} } { return "" }
+    set off ${tbs_voff}
+
+    if { ${off} >= ${tbs_end} } { return "" }
+    binary scan ${payload} @${off}c tag
+    set tag [expr { ${tag} & 0xff }]
+    if { ${tag} == 0xa0 } {
+        set off [call der_skip ${payload} ${off} ${tbs_end}]
+        if { ${off} < 0 } { return "" }
+        binary scan ${payload} @${off}c tag
+        set tag [expr { ${tag} & 0xff }]
+    }
+
+    if { ${tag} != 0x02 } { return "" }
+    set off [call der_skip ${payload} ${off} ${tbs_end}]
+    if { ${off} < 0 } { return "" }
+
+    set off [call der_skip ${payload} ${off} ${tbs_end}]
+    if { ${off} < 0 } { return "" }
+
+    if { ${off} + 2 > ${tbs_end} } { return "" }
+    binary scan ${payload} @${off}c tag
+    if { ([expr { ${tag} & 0xff }]) != 0x30 } { return "" }
+    incr off
+    set r [call der_read_len ${payload} ${off} ${tbs_end}]
+    if { ${r} eq "" } { return "" }
+    set iss_voff [lindex ${r} 1]
+    set iss_end  [expr { ${iss_voff} + [lindex ${r} 0] }]
+    if { ${iss_end} > ${tbs_end} } { return "" }
+    set issuer_oids [call parse_rdns ${payload} ${iss_voff} ${iss_end}]
+    set off ${iss_end}
+
+    set off [call der_skip ${payload} ${off} ${tbs_end}]
+    if { ${off} < 0 } { return "" }
+
+    if { ${off} + 2 > ${tbs_end} } { return "" }
+    binary scan ${payload} @${off}c tag
+    if { ([expr { ${tag} & 0xff }]) != 0x30 } { return "" }
+    incr off
+    set r [call der_read_len ${payload} ${off} ${tbs_end}]
+    if { ${r} eq "" } { return "" }
+    set subj_voff [lindex ${r} 1]
+    set subj_end  [expr { ${subj_voff} + [lindex ${r} 0] }]
+    if { ${subj_end} > ${tbs_end} } { return "" }
+    set subject_oids [call parse_rdns ${payload} ${subj_voff} ${subj_end}]
+    set off ${subj_end}
+
+    set off [call der_skip ${payload} ${off} ${tbs_end}]
+    if { ${off} < 0 } { return "" }
+
+    while { ${off} < ${tbs_end} } {
+        binary scan ${payload} @${off}c tag
+        set tag [expr { ${tag} & 0xff }]
+        if { ${tag} == 0xa1 || ${tag} == 0xa2 } {
+            set off [call der_skip ${payload} ${off} ${tbs_end}]
+            if { ${off} < 0 } { break }
+        } else {
+            break
+        }
+    }
+
+    set ext_oids [list]
+    if { ${off} < ${tbs_end} } {
+        binary scan ${payload} @${off}c tag
+        set tag [expr { ${tag} & 0xff }]
+        if { ${tag} == 0xa3 } {
+            incr off
+            set r [call der_read_len ${payload} ${off} ${tbs_end}]
+            if { ${r} ne "" } {
+                set exta_voff [lindex ${r} 1]
+                set exta_end  [expr { ${exta_voff} + [lindex ${r} 0] }]
+                if { ${exta_end} <= ${tbs_end} } {
+                    binary scan ${payload} @${exta_voff}c tag
+                    if { ([expr { ${tag} & 0xff }]) == 0x30 } {
+                        set xoff [expr { ${exta_voff} + 1 }]
+                        set xr [call der_read_len ${payload} ${xoff} ${exta_end}]
+                        if { ${xr} ne "" } {
+                            set exts_voff [lindex ${xr} 1]
+                            set exts_end  [expr { ${exts_voff} + [lindex ${xr} 0] }]
+                            if { ${exts_end} <= ${exta_end} } {
+                                set ext_oids [call parse_extensions \
+                                    ${payload} ${exts_voff} ${exts_end}]
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    set issuer_str  [join ${issuer_oids}  ","]
+    set subject_str [join ${subject_oids} ","]
+    set ext_str     [join ${ext_oids}     ","]
+
+    if { ${issuer_str} eq "" } {
+        set i_hash "000000000000"
+    } else {
+        binary scan [sha256 ${issuer_str}] H* _h
+        set i_hash [string range ${_h} 0 11]
+    }
+    if { ${subject_str} eq "" } {
+        set s_hash "000000000000"
+    } else {
+        binary scan [sha256 ${subject_str}] H* _h
+        set s_hash [string range ${_h} 0 11]
+    }
+    if { ${ext_str} eq "" } {
+        set e_hash "000000000000"
+    } else {
+        binary scan [sha256 ${ext_str}] H* _h
+        set e_hash [string range ${_h} 0 11]
+    }
+
+    return "${i_hash}_${s_hash}_${e_hash}"
+}
+
+# ---------------------------------------------------------------------------
+# parseServerHello  payload rec_off rec_end ja4s_ver ja4s_tprt
+#   Parses a TLS ServerHello record.
+#   rec_off  = absolute offset of the first byte of the TLS record header
+#              within 'payload'.
+#   rec_end  = exclusive end of the TLS record in 'payload'.
+#   ja4s_ver = H4 hex string of the ServerHello legacy_version field
+#              (bytes rec_off+9..10); may be overridden by extension 0x002b.
+#   Returns the JA4S fingerprint string, or "" on parse error.
+# ---------------------------------------------------------------------------
+proc parseServerHello { payload rec_off rec_end ja4s_ver ja4s_tprt } {
+    # Skip: record header(5) + hs_type(1) + hs_length(3) + server_version(2) + random(32) = 43
+    set field_offset [expr { ${rec_off} + 43 }]
+    if { ${field_offset} >= ${rec_end} } { return "" }
+
+    ## SESSION ID - SKIP
+    binary scan ${payload} @${field_offset}c sessID_len
+    if { ![info exists sessID_len] } { return "" }
+    set sessID_len [expr { ${sessID_len} & 0xff }]
+    set field_offset [expr { ${field_offset} + 1 + ${sessID_len} }]
+    if { ${field_offset} + 2 > ${rec_end} } { return "" }
+
+    ## SERVER CIPHER
+    binary scan ${payload} @${field_offset}H4 ja4s_cipher
+    if { ![info exists ja4s_cipher] || [string length ${ja4s_cipher}] != 4 } { return "" }
+    set field_offset [expr { ${field_offset} + 2 }]
+
+    ## COMPRESSION METHOD - SKIP (single byte)
+    if { ${field_offset} + 1 > ${rec_end} } { return "" }
+    set field_offset [expr { ${field_offset} + 1 }]
+
+    ## EXTENSIONS
+    set ja4s_ecnt 0
+    set ja4s_etype_list [list]
+    set ja4s_alpn "00"
+
+    if { ${field_offset} + 2 <= ${rec_end} } {
+        binary scan ${payload} @${field_offset}S extList_len
+        set extList_len [expr { ${extList_len} & 0xffff }]
+        set field_offset [expr { ${field_offset} + 2 }]
+        if { ${field_offset} + ${extList_len} > ${rec_end} } { return "" }
+        set ext_end [expr { ${field_offset} + ${extList_len} }]
+
+        set ext_iter 0
+        while { ${field_offset} + 4 <= ${ext_end} } {
+            if { [incr ext_iter] > $static::ja4sx_max_iter } { break }
+
+            binary scan ${payload} @${field_offset}H4 ext
+            if { ![info exists ext] || [string length ${ext}] != 4 } { break }
+            lappend ja4s_etype_list ${ext}
+            incr ja4s_ecnt
+            set field_offset [expr { ${field_offset} + 2 }]
+
+            binary scan ${payload} @${field_offset}S ext_len
+            set ext_len [expr { ${ext_len} & 0xffff }]
+            set field_offset [expr { ${field_offset} + 2 }]
+
+            if { ${field_offset} + ${ext_len} > ${ext_end} } { break }
+
+            switch $ext {
+                "0010" {
+                    ## ALPN (16)
+                    if { ${ext_len} >= 3 } {
+                        binary scan ${payload} @${field_offset}Sc alpn_len alpn_str_len
+                        set alpn_str_len [expr { ${alpn_str_len} & 0xff }]
+                        if { ${alpn_str_len} > 0 \
+                             && ${alpn_str_len} + 3 <= ${ext_len} } {
+                            binary scan ${payload} \
+                                @[expr { ${field_offset} + 3 }]a${alpn_str_len} alpn_str
+                        }
+                    }
+                }
+                "0027" {
+                    ## Supported EKT Ciphers (39) - JA4S transport becomes QUIC
+                    set ja4s_tprt "q"
+                }
+                "002b" {
+                    ## Supported Versions (43) - server picks exactly one
+                    if { ${ext_len} >= 2 } {
+                        set sv_hex_len [expr { (${ext_len} - 2) * 2 }]
+                        if { ${sv_hex_len} > 0 } {
+                            binary scan ${payload} \
+                                @[expr { ${field_offset} + 2 }]H${sv_hex_len} ja4s_ver
+                        }
+                    }
+                }
+            }
+
+            set field_offset [expr { ${field_offset} + ${ext_len} }]
+        }
+    }
+
+    if { [info exists alpn_str] && [string length ${alpn_str}] > 0 } {
+        set ja4s_alpn "[string index ${alpn_str} 0][string index ${alpn_str} end]"
+    }
+
+    if { $ja4s_ecnt > 99 } { set ja4s_ecnt 99 }
+    set ja4s_ecnt [format "%02d" $ja4s_ecnt]
+
+    set ja4s_etype_list [lsort $ja4s_etype_list]
+    set ja4s_etype_str ""
+    foreach ext_type_hex $ja4s_etype_list {
+        append ja4s_etype_str "${ext_type_hex},"
+    }
+    set ja4s_etype_str [string trimright ${ja4s_etype_str} ","]
+    binary scan [sha256 ${ja4s_etype_str}] H* ja4s_ext_hash
+    set ja4s_ext_hash_trunc [string range ${ja4s_ext_hash} 0 11]
+
+    switch $ja4s_ver {
+        0304 { set ja4s_ver "13" }
+        0303 { set ja4s_ver "12" }
+        0302 { set ja4s_ver "11" }
+        0301 { set ja4s_ver "10" }
+        0300 { set ja4s_ver "s3" }
+        0200 { set ja4s_ver "s2" }
+        0100 { set ja4s_ver "s1" }
+    }
+
+    return "${ja4s_tprt}${ja4s_ver}${ja4s_ecnt}${ja4s_alpn}_${ja4s_cipher}_${ja4s_ext_hash_trunc}"
+}
+
+
+when SERVER_CONNECTED {
+    unset -nocomplain ja4s
+    unset -nocomplain ja4x
+    set ja4sx_tprt "t"
+    TCP::collect
+}
+
+when SERVER_DATA {
+    set payload [TCP::payload]
+    set plen    [TCP::payload length]
+
+    if { $plen < 5 } {
+        TCP::collect 5
+        return
+    }
+
+    # Walk TLS records looking for ServerHello (hs_type 2) and Certificate
+    # (hs_type 11).  Both are unencrypted in TLS 1.2 and earlier.  Stop
+    # collecting when both are found, a stop condition is reached, or we
+    # exceed the buffer limit.
+    set off  0
+    set done 0
+    set found_hello 0
+    set found_cert  0
+    set iter 0
+
+    while { !${done} && ${off} + 5 <= ${plen} } {
+        if { [incr iter] > $static::ja4sx_max_iter } { set done 1; break }
+
+        binary scan $payload @${off}cH4S rtype proto_ver rec_len
+        set rtype   [expr { $rtype   & 0xff }]
+        set rec_len [expr { $rec_len & 0xffff }]
+        set rec_end [expr { $off + 5 + $rec_len }]
+
+        # If the full record has not yet arrived, collect it (within limits).
+        if { $rec_end > $plen } {
+            if { $rec_end <= $static::ja4sx_max_buf } {
+                TCP::collect $rec_end
+                return
+            }
+            set done 1
+            break
+        }
+
+        if { $rtype == 22 && $rec_len >= 4 } {
+            binary scan $payload @[expr { $off + 5 }]c hs_type
+            set hs_type [expr { $hs_type & 0xff }]
+
+            if { $hs_type == 2 && !${found_hello} } {
+                # ServerHello -- parse JA4S
+                unset -nocomplain _sver
+                binary scan $payload @[expr { $off + 9 }]H4 _sver
+                if { [info exists _sver] } {
+                    set _ja4s [call parseServerHello \
+                        $payload $off $rec_end $_sver $ja4sx_tprt]
+                    if { ${_ja4s} ne "" } { set ja4s ${_ja4s} }
+                }
+                set found_hello 1
+
+            } elseif { $hs_type == 11 && !${found_cert} } {
+                # Certificate -- parse JA4X
+                # Layout relative to $off:
+                #   +5  hs_type (1 byte, already read)
+                #   +6  hs_length (3 bytes, uint24)
+                #   +9  cert_list_length (3 bytes, uint24)
+                #   +12 first_cert_length (3 bytes, uint24)
+                #   +15 first certificate DER data
+                if { $off + 15 <= $rec_end } {
+                    binary scan $payload @[expr { $off + 12 }]ccc fcl_b0 fcl_b1 fcl_b2
+                    set first_cert_len [expr {
+                        (($fcl_b0 & 0xff) << 16) |
+                        (($fcl_b1 & 0xff) <<  8) |
+                         ($fcl_b2 & 0xff)
+                    }]
+                    set cert_off [expr { $off + 15 }]
+                    set cert_end [expr { $cert_off + $first_cert_len }]
+                    if { $first_cert_len > 0 && $cert_end <= $rec_end } {
+                        set _ja4x [call parseCert $payload $cert_off $cert_end]
+                        if { ${_ja4x} ne "" } { set ja4x ${_ja4x} }
+                    }
+                }
+                set found_cert 1
+
+            } elseif { $hs_type == 20 || $hs_type == 21 } {
+                # ChangeCipherSpec (20) or Finished (21) -- no more cleartext records
+                set done 1
+            }
+
+        } elseif { $rtype == 23 || $rtype == 21 } {
+            # ApplicationData or Alert -- stop
+            set done 1
+        }
+
+        # Both fingerprints captured -- no need to read further
+        if { ${found_hello} && ${found_cert} } { set done 1 }
+
+        set off $rec_end
+    }
+
+    # If we fell off the end of the buffer without a hard stop, try to collect more.
+    if { !${done} && $plen < $static::ja4sx_max_buf } {
+        TCP::collect [expr { $plen + 5 }]
+        return
+    }
+
+    TCP::release
+}
+
+when HTTP_REQUEST {
+    # Strip any client-supplied X-JA4S* or X-JA4X* headers to prevent spoofing.
+    foreach jh [HTTP::header names] {
+        set _jl [string tolower ${jh}]
+        if { ${_jl} starts_with "x-ja4s" || ${_jl} starts_with "x-ja4x" } {
+            HTTP::header remove ${jh}
+        }
+    }
+
+    if { [info exists ja4s] } {
+        HTTP::header insert "X-JA4S" ${ja4s}
+    }
+    if { [info exists ja4x] && ${ja4x} ne "" } {
+        HTTP::header insert "X-JA4X" ${ja4x}
+        log local0. "JA4X=${ja4x} src=[IP::client_addr]:[TCP::client_port]"
+    }
+}
