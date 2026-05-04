@@ -1,0 +1,96 @@
+###############################################################################################
+#  iRule to calculate JA4T "TCP Fingerprint"
+#  See JA4 spec on GitHub for more details
+#  https://github.com/FoxIO-LLC/ja4/blob/main/technical_details/JA4.md
+#
+#  Copyright (c) 2024, FoxIO, LLC.
+#  All rights reserved.
+#  Licensed under FoxIO License 1.1
+#  For full license text and more details, see the repo root https://github.com/FoxIO-LLC/ja4
+#
+###############################################################################################
+
+when RULE_INIT {
+    set static::ja4t_max_opts 32
+}
+
+when FLOW_INIT {
+    # To block based on a list of "bad" JA4T values, set "ja4t_blocking" to 1 (one) and
+    # set the name of your JA4T blocklist data group
+    set ja4t_blocking 0
+    set ja4t_blocklist "dg_ja4t_blocklist"
+    set ja4t_log_blocks 1
+
+    set recv_win [DATAGRAM::tcp window]
+    set ops_list ""
+    set opt_count 0
+    unset -nocomplain mss
+    unset -nocomplain win_scale
+
+    foreach option [DATAGRAM::tcp option] {
+        if { [incr opt_count] > $static::ja4t_max_opts } { break }
+        # Each option is returned as "kind value-bytes". Split on the first
+        # space so we never trust a regex to parse attacker-controlled bytes.
+        set sp [string first " " ${option}]
+        if { ${sp} < 0 } {
+            set kind ${option}
+            set value ""
+        } else {
+            set kind  [string range ${option} 0 [expr {${sp} - 1}]]
+            set value [string range ${option} [expr {${sp} + 1}] end]
+        }
+
+        switch ${kind} {
+            "2" {
+                if { [string length ${value}] >= 2 } {
+                    binary scan ${value} S mss
+                    if { [info exists mss] } {
+                        set mss [expr {${mss} & 0xffff}]
+                    }
+                }
+            }
+            "3" {
+                if { [string length ${value}] >= 1 } {
+                    binary scan ${value} c win_scale
+                    if { [info exists win_scale] } {
+                        set win_scale [expr {${win_scale} & 0xff}]
+                    }
+                }
+            }
+        }
+        append ops_list "${kind}-"
+    }
+    set ops_list [string trimright ${ops_list} "-"]
+    if { ${ops_list} eq "" } { set ops_list "00" }
+
+    if { ![info exists win_scale] } { set win_scale 0 }
+    if { ![info exists mss] }       { set mss 0 }
+
+    set ja4t "${recv_win}_${ops_list}_${mss}_${win_scale}"
+
+    if { ${ja4t_blocking} } {
+        if { [class exists ${ja4t_blocklist}] } {
+            if { [set blocked_ja4t [class match -element ${ja4t} equals ${ja4t_blocklist}]] ne "" } {
+                if { ${ja4t_log_blocks} } {
+                    log local0. "Dropping connection from JA4T: '${blocked_ja4t}'"
+                }
+                drop
+            }
+        } else {
+            log local0. "JA4T blocking is enabled but data group '${ja4t_blocklist}' does not exist.  Create data group to enable blocking."
+        }
+    }
+}
+
+when HTTP_REQUEST {
+    # Strip any client-supplied X-JA4T* headers first to prevent spoofing.
+    foreach jh [HTTP::header names] {
+        if { [string tolower ${jh}] starts_with "x-ja4t" } {
+            HTTP::header remove ${jh}
+        }
+    }
+
+    if { [info exists ja4t] } {
+        HTTP::header insert "X-JA4T" ${ja4t}
+    }
+}
